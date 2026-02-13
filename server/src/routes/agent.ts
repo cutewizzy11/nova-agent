@@ -19,6 +19,38 @@ function isToolName(x: unknown): x is ToolName {
   return x === 'makePlan' || x === 'retrieve' || x === 'writeDraft';
 }
 
+function normalizeDecision(parsed: any): ModelDecision | { action: 'tool'; tool: ToolName; input: unknown } | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  // Canonical: {"action":"final","output":"..."}
+  if (parsed.action === 'final') {
+    return { action: 'final', output: String(parsed.output ?? '') };
+  }
+
+  // Common variant: {"final":"..."}
+  if (typeof parsed.final === 'string') {
+    return { action: 'final', output: parsed.final };
+  }
+
+  // Canonical: {"action":"tool","tool":"retrieve","input":...}
+  if (parsed.action === 'tool') {
+    if (isToolName(parsed.tool)) return { action: 'tool', tool: parsed.tool, input: parsed.input };
+    return null;
+  }
+
+  // Common variant: {"tool":"retrieve","input":...}
+  if (isToolName(parsed.tool)) {
+    return { action: 'tool', tool: parsed.tool, input: parsed.input };
+  }
+
+  // Alternative supported: {"action":"retrieve","input":...}
+  if (isToolName(parsed.action)) {
+    return { action: 'tool', tool: parsed.action, input: parsed.input };
+  }
+
+  return null;
+}
+
 function extractJsonObject(text: string): string {
   const trimmed = text.trim();
 
@@ -128,6 +160,7 @@ export function createAgentRouter(): Router {
       'Choose one: ' +
       '{"action":"tool","tool":"makePlan"|"retrieve"|"writeDraft","input":...} ' +
       'or {"action":"final","output":"..."}. ' +
+      'Do not include any keys besides action/tool/input/output. ' +
       'You are continuing a conversation; use the prior messages for context when answering follow-ups. ' +
       'Be reliable: if you need constraints or context, call retrieve.';
 
@@ -158,53 +191,39 @@ export function createAgentRouter(): Router {
         messages.push({ role: 'assistant', content: modelText });
 
         const parsed = safeJsonParse(modelText) as any;
-        if (!parsed || typeof parsed !== 'object' || !('action' in parsed)) {
-          throw new Error('Model did not return valid JSON decision. Ensure the model is following the JSON-only contract.');
+        const decision = normalizeDecision(parsed);
+        if (!decision) {
+          // Ask the model to repair its response instead of failing the whole run.
+          messages.push({
+            role: 'user',
+            content:
+              'Your last message was invalid. Reply again with ONLY a single JSON object (no markdown, no prose). ' +
+              'Use exactly one of: {"action":"tool","tool":"makePlan"|"retrieve"|"writeDraft","input":...} ' +
+              'or {"action":"final","output":"..."}.'
+          });
+          continue;
         }
 
-        if (parsed.action === 'final') {
-          const result: AgentResult = { final: String(parsed.output ?? ''), steps };
+        if (decision.action === 'final') {
+          const result: AgentResult = { final: String((decision as any).output ?? ''), steps };
           res.json(result);
           return;
         }
 
-        // Accept an alternative format where the model uses action as the tool name:
-        // {"action":"writeDraft","input":...}
-        if (isToolName(parsed.action)) {
-          const tool = parsed.action;
-          const input = parsed.input;
-          let toolOutput: unknown;
-          if (tool === 'makePlan') toolOutput = makePlan(toolCtx, input);
-          else if (tool === 'retrieve') toolOutput = retrieve(toolCtx, input);
-          else toolOutput = writeDraft(toolCtx, input);
+        const tool = (decision as any).tool as ToolName;
+        const input = (decision as any).input;
 
-          steps.push({ type: 'tool', call: { tool, input }, output: toolOutput });
-          messages.push({
-            role: 'user',
-            content: JSON.stringify({ tool, output: toolOutput })
-          });
-          continue;
-        }
+        let toolOutput: unknown;
+        if (tool === 'makePlan') toolOutput = makePlan(toolCtx, input);
+        else if (tool === 'retrieve') toolOutput = retrieve(toolCtx, input);
+        else toolOutput = writeDraft(toolCtx, input);
 
-        if (parsed.action === 'tool') {
-          let toolOutput: unknown;
-          if (!isToolName(parsed.tool)) {
-            throw new Error(`Unknown or missing tool: ${String(parsed.tool)}`);
-          }
-
-          if (parsed.tool === 'makePlan') toolOutput = makePlan(toolCtx, parsed.input);
-          else if (parsed.tool === 'retrieve') toolOutput = retrieve(toolCtx, parsed.input);
-          else toolOutput = writeDraft(toolCtx, parsed.input);
-
-          steps.push({ type: 'tool', call: { tool: parsed.tool, input: parsed.input }, output: toolOutput });
-          messages.push({
-            role: 'user',
-            content: JSON.stringify({ tool: parsed.tool, output: toolOutput })
-          });
-          continue;
-        }
-
-        throw new Error(`Unknown model action: ${String(parsed.action)}`);
+        steps.push({ type: 'tool', call: { tool, input }, output: toolOutput });
+        messages.push({
+          role: 'user',
+          content: JSON.stringify({ tool, output: toolOutput })
+        });
+        continue;
       }
 
       res.status(500).json({ error: 'Agent exceeded max turns without producing a final answer.', steps });
